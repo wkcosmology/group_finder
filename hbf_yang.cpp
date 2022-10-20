@@ -13,17 +13,112 @@
 #include <iostream>
 #include <numeric>
 #include <set>
+#include <string>
 #include <vector>
+
+#include <hippcntl.h>
+#include <hippio.h>
 
 #include "nbr_finder.hpp"
 
 using namespace std;
 
+using HIPP::IO::H5File;
+
+class LinearInterp
+{
+   public:
+    LinearInterp() {}
+    LinearInterp(const vector<double> &xp, const vector<double> &yp, bool sorted = false)
+    {
+        Init(xp, yp);
+        if (!sorted)
+            SortFp();
+    }
+    void Init(const vector<double> &xp, const vector<double> &yp, bool sorted = false)
+    {
+        if (xp.size() != yp.size()) {
+            std::cout << "xp and yp have different size" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        fp_.resize(xp.size());
+        for (size_t i = 0; i < xp.size(); ++i)
+            fp_[i] = std::make_pair(xp[i], yp[i]);
+        if (!sorted)
+            SortFp();
+    };
+    double Interp(double xp) const
+    {
+        if (fp_.size() == 0) {
+            std::cout << "Linear Interp input illegal" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        if ((xp < fp_.front().first) || std::isnan(xp))
+            return fp_.front().second;
+        else if (xp >= fp_.back().first)
+            return fp_.back().second;
+
+        size_t i = 0;
+        while (xp >= fp_[i + 1].first)
+            ++i;
+        double x1(fp_[i].first), y1(fp_[i].second), x2(fp_[i + 1].first),
+            y2(fp_[i + 1].second);
+        return y1 + (xp - x1) / (x2 - x1) * (y2 - y1);
+    }
+
+   private:
+    void SortFp()
+    {
+        std::sort(
+            fp_.begin(),
+            fp_.end(),
+            [](const std::pair<double, double> &x, const std::pair<double, double> &y) {
+                return x.first < y.first;
+            });
+    }
+    vector<std::pair<double, double>> fp_;
+};
+
+class HaloMassFunc
+{
+   public:
+    HaloMassFunc(const string &filename, double vol) : kVol_(vol)
+    {
+        auto f = H5File(filename, "r");
+        f.open_dataset("HaloMass").read(hms_);
+        f.open_dataset("CHMF").read(chmf_);
+    }
+
+    vector<double> GenerateHMSamp(int n_samp)
+    {
+        vector<double> hm_samp(n_samp);
+
+        for (auto &v: chmf_)
+            v *= kVol_;
+
+        if (*chmf_.end() < n_samp)
+            cout << "Maximum # of sample: " << *chmf_.end() << ", required #: " << n_samp
+                 << endl;
+
+        auto f = LinearInterp(chmf_, hms_);
+        for (int i = 0; i < n_samp; ++i)
+            hm_samp[i] = f.Interp(i + 1);
+
+        return hm_samp;
+    }
+
+   private:
+    vector<double> hms_, chmf_;
+    const double kVol_;
+};
+
 class YangFinder
 {
    private:
     struct Group {
-        double z, tot_sm, hm, conc, r_vir, sig_v;
+        double z, tot_sm, hm;
+        double r_vir, sig_v;  // for neighbor searching
         set<int> mems;
         array<double, 3> pos;
     };
@@ -34,13 +129,10 @@ class YangFinder
      *
      * @param pos [positions, unit (Mpc, Mpc, redshift), z-direction is the
      * third one]
-     * @param log_sm [log of stellar mass]
-     * @param hmf [halo mass array, generated from halo mass function]
      * @param z [redshift for group searching]
+     * @param sm [log of stellar mass]
+     * @param hmf [halo mass array, generated from halo mass function]
      * @param period [box size for periodic box]
-     * @param rp_max [maximum searching radius on the projection direction,
-     * unit: Mpc]
-     * @param pi_max [maximum searching radius on the los direction, unit: Mpc]
      */
     YangFinder(
         const vector<array<double, 3>> &pos,
@@ -48,17 +140,8 @@ class YangFinder
         const vector<double> &sm,
         const vector<double> &hmf,
         double period,
-        double rp_max,
-        double pi_max,
         double p_bg)
-        : gal_pos_(pos),
-          gal_sm_(sm),
-          hmf_(hmf),
-          gal_z_(z),
-          period_(period),
-          rp_max_(rp_max),
-          pi_max_(pi_max),
-          p_bg_(p_bg)
+        : gal_pos_(pos), gal_sm_(sm), hmf_(hmf), gal_z_(z), period_(period), p_bg_(p_bg)
     {
         // input validity check
         n_gal_ = pos.size();
@@ -76,9 +159,9 @@ class YangFinder
         // check position
         if (period_ > 0) {
             for (auto &p: gal_pos_) {
-                for (auto &i: p) {
-                    if (i < 0 || i > period_) {
-                        cout << "Position out of range" << i << endl;
+                for (auto &x: p) {
+                    if (x < 0 || x > period_) {
+                        cout << "Position out of range" << x << endl;
                         exit(EXIT_FAILURE);
                     }
                 }
@@ -100,14 +183,17 @@ class YangFinder
 
         // itaration
         for (int it = 0; it < n_iter; ++it) {
+            // reset all the probability
             gal_prob_.assign(n_gal_, -1);
+
+            // finding neighbor galaxies around groups
             vector<array<double, 3>> grp_pos;
             vector<array<double, 2>> grp_search;  // maximum searching radius
             for (auto &grp: grps) {
                 grp_pos.push_back(grp.pos);
-                grp_search.push_back({grp.r_vir, grp.sig_v / H0_});
+                grp_search.push_back(
+                    {f_rvir_ * grp.r_vir, f_sigv_ * grp.sig_v / kH_ / 100});
             }
-
             auto nbr_finder = NbrFinder3d(
                 gal_pos_,
                 array<int, 3>{100, 100, 100},
@@ -119,39 +205,71 @@ class YangFinder
             for (size_t igrp = 0; igrp < grps.size(); ++igrp) {
                 auto &grp = grps[igrp];
 
-                // loop all the neighbor galaxies around given group
-                for (auto &nbr: nbrs[igrp]) {
-                    int i_gal = nbr.first;
-                    double p =
-                        Prob(grp.hm, nbr.second[0], grp.z, gal_z_[nbr.first]);
-                    // skip when the probability is too low
-                    if (p < p_bg_ || p < gal_prob_[i_gal])
-                        continue;
-                    // 1. delete this gal from previous group
-                    // 2. insert it to current group
-                    // 3. update gal_prob_ and gal_igrp_
-                    grps[gal_igrp_[i_gal]].mems.erase(i_gal);
-                    grp.mems.insert(i_gal);
-                    gal_prob_[i_gal] = p;
-                    gal_igrp_[i_gal] = igrp;
-                }
+                // skip groups with no members
+                // (members were assigned to more massive groups)
+                if (grp.mems.size() == 0)
+                    continue;
 
-                // !!! Since we expect very large prob for central, for group
-                // with only one member, we should make it vulnerable to be
-                // included by other groups. Otherwise, these centrals will
-                // never be assigned to other groups
-                if (grp.mems.size() == 1)
-                    gal_prob_[*grp.mems.begin()] = -1;
+                // iteration until no more changes for group members
+                set<int> prev_mems;
+                int it_mem = 0;
+                double grp_hm = grp.hm;
+                double grp_z = grp.z;
+                array<double, 3> grp_pos = grp.pos;
+                while (prev_mems != grp.mems && it_mem < max_mem_iter_) {
+                    prev_mems = grp.mems;
+                    ++it_mem;
+                    // loop all the neighbor galaxies
+                    for (auto &nbr: nbrs[igrp]) {
+                        int i_gal = nbr.first;
+                        double rp = Dist(grp_pos, gal_pos_[nbr.first]);
+                        double p = Prob(grp_hm, rp, grp_z, gal_z_[nbr.first]);
+                        // for beighbors above the threshold
+                        if (p > p_bg_ && p > gal_prob_[i_gal]) {
+                            // 1. delete this gal from previous group
+                            // 2. insert it to current group
+                            // 3. update gal_prob_ and gal_igrp_
+                            grps[gal_igrp_[i_gal]].mems.erase(i_gal);
+                            grp.mems.insert(i_gal);
+                            gal_prob_[i_gal] = p;
+                            gal_igrp_[i_gal] = igrp;
+                        }
+                    }
+                    // update halo information using new members
+                    UpdateHalo(grp.mems, grp_hm, grp_pos, grp_z);
+                }
             }
             gal_igrp_ = RegulateGrp(grps);
         }
     }
 
+    // Update halo mass, pos, z using member galaxies
+    void UpdateHalo(const set<int> &mems, double &hm, array<double, 3> &pos, double &z)
+    {
+        if (mems.size() == 0)
+            return;
+        double tot_mass = 0;
+        pos = {0, 0, 0};
+        z = 0;
+        for (auto i: mems) {
+            double mass = pow(10.0, gal_sm_[i]);
+            tot_mass += mass;
+            for (int j = 0; j < 3; ++j)
+                pos[j] += gal_pos_[i][j] * mass;
+            z += gal_z_[i] * mass;
+        }
+        z /= tot_mass;
+        for (int j = 0; j < 3; ++j)
+            pos[j] /= tot_mass;
+        hm = totsm2hm_.Interp(log10(tot_mass + 1e-9));
+    }
+
     // Regulate groups
     // 0. input grps must have valid mem information (only)
-    // 1. eliminate unreliable group
-    // 2. sort groups according to total stellar mass or halo mass
-    // 3. calculate halo properties
+    // 1. eliminate groups with zero members
+    // 2. update halo properties
+    // 3. sort groups according to halo mass
+    // 4. update gal_igrp
     vector<int> RegulateGrp(vector<Group> &grps)
     {
         // eliminate invalid groups
@@ -169,37 +287,20 @@ class YangFinder
             grps_new.push_back(grp);
         }
         grps = grps_new;
-        // performance SHAM
-        // assign halo mass
-        // calculate halo related quantities
-        auto arr_hm = SHAM(arr_totsm);
+
+        // re-calibrate M_{*, tot} - M_h relation
+        CaliTotSm2Hm(arr_totsm);
+
+        // update halo mass, halo pos, and halo z
+        // update halo properties
         for (int igrp = 0; igrp < grps.size(); ++igrp) {
             auto &grp = grps[igrp];
-            double hm = arr_hm[igrp];
-            double z = grp.z;
-            grp.hm = hm;
-            grp.conc = Mass2Conc(hm, z);
-            grp.r_vir = Mass2Rvir(hm, z);
-            grp.sig_v = Mass2SigV(hm, z);
-            // TODO: update pos and redshift
-            array<double, 3> pos_tmp;
-            double z_tmp = 0;
-            double tot_sm_tmp = 0;
-            for (auto i_mem: grp.mems) {
-                double sm_tmp = pow(10.0, gal_sm_[i_mem] - 10);
-                tot_sm_tmp += sm_tmp;
-                for (int i = 0; i < 3; ++i)
-                    pos_tmp[i] += sm_tmp * gal_pos_[i_mem][i];
-                z_tmp += sm_tmp * gal_z_[i_mem];
-            }
-            for (int i = 0; i < 3; ++i)
-                grp.pos[i] = pos_tmp[i] / tot_sm_tmp;
-            grp.z = z_tmp / tot_sm_tmp;
+            UpdateHalo(grp.mems, grp.hm, grp.pos, grp.z);
+            grp.r_vir = Mass2Rvir(grp.hm, grp.z);
+            grp.sig_v = Mass2SigV(grp.hm, grp.z);
         }
         // sort grps according to halo mass
-        sort(grps.begin(), grps.end(), [](Group a, Group b) {
-            return a.hm > b.hm;
-        });
+        sort(grps.begin(), grps.end(), [](Group a, Group b) { return a.hm > b.hm; });
         // assign gal_igrp
         vector<int> gal_igrp(n_gal_, -1);
         for (int i = 0; i < grps.size(); ++i)
@@ -209,6 +310,25 @@ class YangFinder
         return gal_igrp;
     }
 
+    // calibrate the M_{*, tot} - M_h relation
+    // output a interpolator
+    LinearInterp CaliTotSm2Hm(const vector<double> &tot_sm)
+    {
+        auto hm = SHAM(tot_sm);
+        auto f1 = LinearInterp(tot_sm, hm);
+        vector<double> totsm_samp(np_totsm2hm_), hm_samp(np_totsm2hm_);
+        int step = int(floor(tot_sm.size() / np_totsm2hm_)) - 1;
+        for (int i = 0; i < np_totsm2hm_; ++i) {
+            totsm_samp[i] = tot_sm[i * step];
+            hm_samp[i] = hm[i * step];
+        }
+        *totsm_samp.end() = *tot_sm.end();
+        *hm_samp.end() = *hm.end();
+        return LinearInterp(totsm_samp, hm_samp);
+    }
+
+    // abundance match proxy with cumulative halo mass function
+    // output order is the same as the rank of proxy
     vector<double> SHAM(const vector<double> &proxy)
     {
         vector<double> hm(proxy.size(), 0);
@@ -229,7 +349,7 @@ class YangFinder
         double conc = Mass2Conc(hm, z_grp);
         double sig_v = Mass2SigV(hm, z_grp);
         double r_vir = Mass2Rvir(hm, z_grp);
-        p = H0_ / c_ * SigmaR(rp, r_vir, conc) * GaussianZ(z_grp, z_gal, sig_v);
+        p = kH_ * 100 / kC_ * SigmaR(rp, r_vir, conc) * GaussianZ(z_grp, z_gal, sig_v);
         return p;
     }
 
@@ -240,17 +360,19 @@ class YangFinder
         return c;
     }
 
-    // TODO:
     inline double Mass2Rvir(double hm, double z)
     {
-        double r;
+        // This formula comes from Yang et al. 2021, corrected for r_200
+        hm = pow(10.0, hm);
+        double r = 0.781 / kH_ * pow(hm / 1e14 * kH_ / kOmega_m_ * 180 / 200, 1.0 / 3);
+        r /= (1 + z);
         return r;
     }
 
-    // TODO:
     inline double Mass2SigV(double hm, double z)
     {
-        double sig_v;
+        hm = pow(10.0, hm);
+        double sig_v = 632 * pow(hm * kOmega_m_ * kH_ / 1e14, 0.3224);
         return sig_v;
     }
 
@@ -258,8 +380,7 @@ class YangFinder
     {
         if (r_p < 1e-3)
             return 1e10;
-        double delta =
-            60 * conc * conc * conc / (log(1 + conc) - conc / (1 + conc));
+        double delta = 60 * conc * conc * conc / (log(1 + conc) - conc / (1 + conc));
         double x = r_p * conc / r_vir;
         double x2m = x * x - 1;
         double f;
@@ -278,8 +399,16 @@ class YangFinder
     {
         double zp1 = z_grp + 1;
         double dz = z_gal - z_grp;
-        double p = c_ / sig_v / zp1 * exp(-0.5 * pow(c_ * dz / sig_v / zp1, 2));
+        double p = kC_ / sig_v / zp1 * exp(-0.5 * pow(kC_ * dz / sig_v / zp1, 2));
         return p;
+    }
+
+    inline double Dist(const array<double, 3> &x, const array<double, 3> &y)
+    {
+        double d = 0;
+        for (int i = 0; i < 3; ++i)
+            d += (x[i] - y[i]) * (x[i] - y[i]);
+        return sqrt(d);
     }
 
    private:
@@ -289,8 +418,6 @@ class YangFinder
     const vector<double> &gal_z_;
     const vector<double> &hmf_;
     const double period_;
-    const double rp_max_;
-    const double pi_max_;
     const double p_bg_;
     // output
     vector<double> host_hm_;
@@ -299,6 +426,16 @@ class YangFinder
     vector<double> gal_prob_;
     vector<int> gal_igrp_;
     int n_gal_;
-    const double c_ = 3e5;  // light speed, unit: km/s
-    const double H0_ = 67;  // Hubble constant, unit: km/s/Mpc
+    LinearInterp totsm2hm_;
+    // constants: light speed, Hubble constant
+    const double kC_ = 3e5;
+    const double kH_ = 0.67;
+    const double kOmega_m_ = 0.3;
+    // number of points for interpolating totsm and hm relation
+    const int np_totsm2hm_ = 100;
+    // maximum number of iterations in group member assignment
+    const int max_mem_iter_ = 20;
+    // neighbor searching range
+    const double f_rvir_ = 3;
+    const double f_sigv_ = 3;
 };
