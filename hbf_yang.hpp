@@ -1,3 +1,6 @@
+#ifndef HBF_YANG_CPP_
+#define HBF_YANG_CPP_
+
 /**
  * File            : hbf_yang.cpp
  * Author          : Kai Wang <wkcosmology@gmail.com>
@@ -16,102 +19,10 @@
 #include <string>
 #include <vector>
 
-#include <hippcntl.h>
-#include <hippio.h>
-
 #include "nbr_finder.hpp"
+#include "utility.hpp"
 
 using namespace std;
-
-using HIPP::IO::H5File;
-
-class LinearInterp
-{
-   public:
-    LinearInterp() {}
-    LinearInterp(const vector<double> &xp, const vector<double> &yp, bool sorted = false)
-    {
-        Init(xp, yp);
-        if (!sorted)
-            SortFp();
-    }
-    void Init(const vector<double> &xp, const vector<double> &yp, bool sorted = false)
-    {
-        if (xp.size() != yp.size()) {
-            std::cout << "xp and yp have different size" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        fp_.resize(xp.size());
-        for (size_t i = 0; i < xp.size(); ++i)
-            fp_[i] = std::make_pair(xp[i], yp[i]);
-        if (!sorted)
-            SortFp();
-    };
-    double Interp(double xp) const
-    {
-        if (fp_.size() == 0) {
-            std::cout << "Linear Interp input illegal" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-
-        if ((xp < fp_.front().first) || std::isnan(xp))
-            return fp_.front().second;
-        else if (xp >= fp_.back().first)
-            return fp_.back().second;
-
-        size_t i = 0;
-        while (xp >= fp_[i + 1].first)
-            ++i;
-        double x1(fp_[i].first), y1(fp_[i].second), x2(fp_[i + 1].first),
-            y2(fp_[i + 1].second);
-        return y1 + (xp - x1) / (x2 - x1) * (y2 - y1);
-    }
-
-   private:
-    void SortFp()
-    {
-        std::sort(
-            fp_.begin(),
-            fp_.end(),
-            [](const std::pair<double, double> &x, const std::pair<double, double> &y) {
-                return x.first < y.first;
-            });
-    }
-    vector<std::pair<double, double>> fp_;
-};
-
-class HaloMassFunc
-{
-   public:
-    HaloMassFunc(const string &filename, double vol) : kVol_(vol)
-    {
-        auto f = H5File(filename, "r");
-        f.open_dataset("HaloMass").read(hms_);
-        f.open_dataset("CHMF").read(chmf_);
-    }
-
-    vector<double> GenerateHMSamp(int n_samp)
-    {
-        vector<double> hm_samp(n_samp);
-
-        for (auto &v: chmf_)
-            v *= kVol_;
-
-        if (*chmf_.end() < n_samp)
-            cout << "Maximum # of sample: " << *chmf_.end() << ", required #: " << n_samp
-                 << endl;
-
-        auto f = LinearInterp(chmf_, hms_);
-        for (int i = 0; i < n_samp; ++i)
-            hm_samp[i] = f.Interp(i + 1);
-
-        return hm_samp;
-    }
-
-   private:
-    vector<double> hms_, chmf_;
-    const double kVol_;
-};
 
 class YangFinder
 {
@@ -241,7 +152,38 @@ class YangFinder
             }
             gal_igrp_ = RegulateGrp(grps);
         }
+        // output group ID, if central, and halo mass
+        host_hm_.resize(n_gal_);
+        group_id_.resize(n_gal_);
+        if_mm_.resize(n_gal_);
+        grp_pos_.resize(n_gal_);
+        grp_z_.resize(n_gal_);
+        for (int igrp = 0; igrp < grps.size(); ++igrp) {
+            auto &grp = grps[igrp];
+            if_mm_[*grp.mems.begin()] = 1;
+            int mm_mem = *grp.mems.begin();
+            double mm_sm = 0;
+            for (auto &mem: grp.mems) {
+                host_hm_[mem] = grp.hm;
+                group_id_[mem] = igrp;
+                grp_pos_[mem] = grp.pos;
+                grp_z_[mem] = grp.z;
+                if (gal_sm_[mem] > mm_sm) {
+                    if_mm_[mm_mem] = 0;
+                    if_mm_[mem] = 1;
+                    mm_sm = gal_sm_[mem];
+                    mm_mem = mem;
+                }
+            }
+        }
     }
+
+    // output
+    const vector<int> &GetGrpID() { return group_id_; }
+    const vector<double> &GetHaloMass() { return host_hm_; }
+    const vector<int> &GetIfMM() { return if_mm_; }
+    const vector<array<double, 3>> &GetGrpPos() { return grp_pos_; }
+    const vector<double> &GetGrpZ() { return grp_z_; }
 
     // Update halo mass, pos, z using member galaxies
     void UpdateHalo(const set<int> &mems, double &hm, array<double, 3> &pos, double &z)
@@ -343,7 +285,7 @@ class YangFinder
         return hm;
     }
 
-    double Prob(double hm, double rp, double z_grp, double z_gal)
+    inline double Prob(double hm, double rp, double z_grp, double z_gal)
     {
         double p;
         double conc = Mass2Conc(hm, z_grp);
@@ -353,10 +295,13 @@ class YangFinder
         return p;
     }
 
-    // TODO:
     inline double Mass2Conc(double hm, double z)
     {
-        double c = 10;
+        // Adopted from Dutton & Maccio 2014
+        hm = hm + log10(kH_);
+        double a = 0.520 + (0.905 - 0.520) * exp(-0.617 * pow(z, 1.21));
+        double b = -0.101 + 0.026 * z;
+        double c = pow(10.0, a + b * (hm - 12));
         return c;
     }
 
@@ -371,6 +316,7 @@ class YangFinder
 
     inline double Mass2SigV(double hm, double z)
     {
+        // Adopted from Yang et al. 2021
         hm = pow(10.0, hm);
         double sig_v = 632 * pow(hm * kOmega_m_ * kH_ / 1e14, 0.3224);
         return sig_v;
@@ -421,7 +367,10 @@ class YangFinder
     const double p_bg_;
     // output
     vector<double> host_hm_;
+    vector<int> group_id_;
     vector<int> if_mm_;
+    vector<array<double, 3>> grp_pos_;
+    vector<double> grp_z_;
     // ancillary
     vector<double> gal_prob_;
     vector<int> gal_igrp_;
@@ -439,3 +388,4 @@ class YangFinder
     const double f_rvir_ = 3;
     const double f_sigv_ = 3;
 };
+#endif /* end of include guard: HBF_YANG_CPP_ */

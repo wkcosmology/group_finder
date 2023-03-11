@@ -1,4 +1,4 @@
-run_group_finder: run_group_finder.cpp
+run_group_finder: run_group_finder.cpp nbr_finder.o
 	$(CC) -O3 -std=c++17 $^ -o run_group_finder.out -lhippcntl -lhdf5 -lhippio -lstdc++fs -lm
 nbr_finder.o: nbr_finder.cpp
 	$(CC) -O3 -std=c++17 -c $<
